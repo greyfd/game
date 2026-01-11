@@ -13,7 +13,8 @@
 ### A. Configuration (`UWorldGenConfig`)
 *   **Base Class:** `UDataAsset`
 *   **Purpose:** Defines the rules and constraints for the world generation steps.
-*   **Asset Hygiene:** All visual references MUST use `TSoftObjectPtr` to prevent loading gigabytes of biome assets during the simulation phase.
+*   **Asset Hygiene:** All visual references MUST use `TSoftObjectPtr`.
+*   **PCG Integration:** We will use **PCG Attribute Sets** to feed `FWorldState` data (Height, Biome, RiverMask) into a PCG Graph for efficient scattering of trees and rocks, replacing manual HISM management where possible.
 
 ```cpp
 USTRUCT(BlueprintType)
@@ -106,6 +107,9 @@ public:
 
     UPROPERTY(EditAnywhere, Category = "Layer 4: Civilization")
     FCivilizationConfig Civilization;
+    
+    UPROPERTY(EditAnywhere, Category = "Layer 4: Naming")
+    UDataTable* SettlementNameTable; // Col 1: Prefix, Col 2: Suffix, Col 3: TypeTag
 
     UPROPERTY(EditAnywhere, Category = "Assets")
     TArray<FBiomeAssetDefinition> Biomes;
@@ -138,6 +142,13 @@ struct FWorldState
     TArray<float> MoistureMap;
 
     UPROPERTY()
+    TArray<float> MoistureMap;
+    
+    // Derived Data (Cached for Civ logic)
+    UPROPERTY()
+    TArray<float> SlopeMap;
+
+    UPROPERTY()
     TArray<uint8> BiomeIDs; // Index into Config->Biomes
 
     // --- Layer 2: Climate Aux ---
@@ -149,7 +160,15 @@ struct FWorldState
     UPROPERTY()
     TArray<FVector2D> FlowField; 
     
+    // Tracks accumulated water (River Width)
+    UPROPERTY()
+    TArray<float> WaterVolumeMap;
+    
     // --- Layer 4: Civilization (Sparse Data) ---
+    // Strategic Value (0.0 - 1.0) for every cell: High Ground, Chokepoints, Bridgeheads
+    UPROPERTY()
+    TArray<float> StrategicScoreMap;
+
     // We do NOT use AActor for cities. We use light structs.
     UPROPERTY()
     TArray<FSettlementNode> Settlements;
@@ -159,6 +178,16 @@ struct FWorldState
 
     // Helper to get index
     FORCEINLINE int32 GetIndex(int32 X, int32 Y) const { return Y * Width + X; }
+};
+
+UENUM(BlueprintType)
+enum class EPrimaryResource : uint8
+{
+    Agriculture,
+    Mining,
+    Forestry,
+    Trade,
+    Military
 };
 
 USTRUCT(BlueprintType)
@@ -171,6 +200,14 @@ struct FSettlementNode
 
     UPROPERTY()
     FName SettlementName;
+
+    // The "Why" (Source 1)
+    UPROPERTY()
+    EPrimaryResource Specialization; 
+
+    // Visual Archetype (Source 1 & 6)
+    UPROPERTY()
+    bool bIsFortified; // True if on HighGround or Chokepoint (Gateway)
 
     UPROPERTY()
     int32 Population;
@@ -253,73 +290,159 @@ void FTectonicsPass::Execute(FWorldState& State, const FTectonicsConfig& Config)
     // 2. PARALLEL: Plate Assignment & Movement Vector
     ParallelFor(NumCells, [&](int32 Index)
     {
-        int32 X = Index % State.Width;
-        int32 Y = Index / State.Width;
+        // ...
         
-        // Find nearest plate center
-        int32 NearestPlate = FindNearestSite(X, Y, VoronoiSites);
-        PlateIDs[Index] = NearestPlate;
+        // Determine Collision Type based on Plate Density (Oceanic vs Continental)
+        // EPlateType MyType = PlateTypes[PlateID];
+        // EPlateType NeighborType = PlateTypes[NeighborID];
         
-        // Determine Collision Type (Continental vs Oceanic) based on Plate Type
-        // If Converging: Raise terrain (Himalayas/Andes)
-        // If Diverging: Lower terrain (Rift Valleys/Ocean Ridges)
-        
-        // Apply Hotspots:
-        // Random check for "Heat Point" -> punch hole in plate -> Island Chain logic
+        // C-C Collision: Massive Folding (Himalayas) -> Height += FoldingStrength
+        // O-C Collision: Subduction (Andes) -> Height += FoldingStrength (Volcanoes) AND Height -= TrenchDepth
+        // O-O Divergence: Mid-Ocean Ridge -> Height += RidgeHeight
+        // C-C Divergence: Rift Valley -> Height -= RiftDepth
         
         State.HeightMap[Index] = CalculatedHeight;
     });
 }
-
-void FClimatePass::Execute(FWorldState& State, const FClimateConfig& Config)
-{
-    // 1. Establish Prevailing Winds
-    // Iterate Latitude:
-    // Equator -> Trade Winds (East to West)
-    // Mid-Latitudes -> Westerlies (West to East)
-    
-    // 2. MOISTURE PARTICLE SIMULATION
-    // Trace particles along WindField.
-    // If Height increases (Mountains):
-    //    - Drop rain (Orographic Lift) -> Increase MoistureMap
-    //    - Reduce Particle Moisture
-    //    - Result: Rain Shadow on leeward side (Deserts)
-    
-    // 3. Set Biomes
-    // Combine Temp + Moisture -> Biome ID (e.g., High Temp + High Rain = Jungle)
-}
-
+// ...
 void FHydrologyPass::Execute(FWorldState& State, const FHydrologyConfig& Config)
 {
-    // 1. Identify Watersheds (High Rain + High Elev)
-    // Spawn 'Drop' agents.
-    
+    // ...
     // 2. Flow Simulation (Iterative)
     // While(Drop.HasMomentum):
     //    - Move to lowest neighbor
-    //    - Erode terrain (Deepen channel)
-    //    - Classify River Age:
-    //      * Youthful: High slope, narrow, straight
-    //      * Mature: Med slope, meandering
-    //      * Old: Low slope, wide, deposition (Delta)
+    //    - Accumulate Flow Volume: State.WaterVolumeMap[CurrentIndex] += Drop.Volume;
+    //    - Erode terrain (Deepen channel) based on Volume/Speed
     
     // 3. Write to FlowField & RiverMask
+    // If (WaterVolumeMap[i] > SmallThreshold) -> Creek Mesh
+    // If (WaterVolumeMap[i] > LargeThreshold) -> Wide River Mesh
+}
+
+/**
+ * STRATEGIC VALUE ALGORITHM (Sector Analysis)
+ * Analyzes local neighbor configuration to find Chokepoints (Opposing Obstacles) 
+ * and Defensible Terrain (High Ground).
+ * Runs in O(N) inside ParallelFor.
+ */
+void FCivilizationPass::CalculateStrategicValue(FWorldState& State, const FCivilizationConfig& Config)
+{
+    const int32 Width = State.Width;
+    const int32 Height = State.Height;
+    const int32 NumCells = State.HeightMap.Num();
+
+    // 1. PRE-CALC PASSABILITY MASK (SoA)
+    TArray<bool> IsWalkable;
+    IsWalkable.SetNumUninitialized(NumCells);
+
+    // Thresholds (could be in Config)
+    const float MaxWalkableSlope = 0.4f; 
+    const float DeepWaterThreshold = 0.6f; 
+
+    ParallelFor(NumCells, [&](int32 i)
+    {
+        // Simple heuristic: Walkable if not too steep and not underwater
+        // (Slope calculation omitted for brevity)
+        bool bIsWater = State.MoistureMap[i] > DeepWaterThreshold && State.HeightMap[i] < 0.2f; 
+        bool bIsSteep = State.SlopeMap[i] > MaxWalkableSlope; 
+        
+        IsWalkable[i] = !bIsWater && !bIsSteep;
+    });
+
+    // 2. CALCULATE STRATEGIC SCORE
+    State.StrategicScoreMap.SetNumZeroed(NumCells);
+
+    ParallelFor(NumCells, [&](int32 i)
+    {
+        int32 X = i % Width;
+        int32 Y = i / Width;
+
+        // Skip edges
+        if (X == 0 || X == Width - 1 || Y == 0 || Y == Height - 1) return;
+
+        // Skip unwalkable terrain (can't build a fort inside a cliff)
+        if (!IsWalkable[i]) return;
+
+        float Score = 0.0f;
+
+        // --- A. HIGH GROUND DETECTION (Local Prominence) ---
+        // "Hills and cliffs... offer defensible positions" 
+        float AvgNeighborHeight = 0.0f;
+        
+        // Sample 4 cardinal neighbors
+        AvgNeighborHeight += State.HeightMap[State.GetIndex(X + 1, Y)];
+        AvgNeighborHeight += State.HeightMap[State.GetIndex(X - 1, Y)];
+        AvgNeighborHeight += State.HeightMap[State.GetIndex(X, Y + 1)];
+        AvgNeighborHeight += State.HeightMap[State.GetIndex(X, Y - 1)];
+        AvgNeighborHeight *= 0.25f;
+
+        float Prominence = State.HeightMap[i] - AvgNeighborHeight;
+        
+        // If higher than neighbors (but not a spike), add score.
+        if (Prominence > 0.05f) 
+        {
+            Score += Prominence * 5.0f; 
+        }
+
+        // --- B. CHOKEPOINT DETECTION (Opposing Obstacles) ---
+        // "Mountain pass or river narrows... becomes a choke point"
+        bool N = IsWalkable[State.GetIndex(X, Y + 1)];
+        bool S = IsWalkable[State.GetIndex(X, Y - 1)];
+        bool E = IsWalkable[State.GetIndex(X + 1, Y)];
+        bool W = IsWalkable[State.GetIndex(X - 1, Y)];
+
+        // Case 1: Vertical Corridor (E/W blocked, N/S open)
+        if (N && S && !E && !W)
+        {
+            Score += 10.0f; 
+        }
+        // Case 2: Horizontal Corridor (N/S blocked, E/W open)
+        else if (!N && !S && E && W)
+        {
+            Score += 10.0f;
+        }
+
+        // --- C. BRIDGEHEAD DETECTION ---
+        // "Big reasons that a town grows... are bridges"
+        // Check 2 tiles away. If I am Land, neighbor is Water, neighbor+1 is Land, 
+        // then I am a potential bridgehead.
+        int32 IndexEast = State.GetIndex(X + 1, Y);
+        int32 IndexEast2 = State.GetIndex(X + 2, Y);
+        
+        if (X < Width - 2) // Bounds check for +2
+        {
+            bool bRiverAdjacent = !IsWalkable[IndexEast]; // Assuming water is unwalkable
+            bool bFarSideWalkable = IsWalkable[IndexEast2];
+
+            if (bRiverAdjacent && bFarSideWalkable)
+            {
+                 Score += 8.0f; 
+            }
+        }
+        
+        // (Similar checks for West/North/South omitted for brevity)
+
+        State.StrategicScoreMap[i] = Score;
+    });
 }
 
 void FCivilizationPass::Execute(FWorldState& State, const FCivilizationConfig& Config)
 {
+    // 0. PRE-CALC STRATEGIC VALUE
+    CalculateStrategicValue(State, Config);
+
     // 1. SCORING MATRIX (SoA Logic)
-    // Calculate 'SettlementScore' map based on:
-    //   - Near Fresh Water (Hydrology Layer)
-    //   - Flat/Defensible Terrain (Tectonics Layer)
-    //   - Resource Nodes
+    // Iterate Grid:
+    // Determine Resource Potential (Forest/Ore/Farm) similar to before.
     
-    // 2. PATHFINDING
-    // Connect high-score clusters with MST (Minimum Spanning Tree) or A* for Trade Routes.
+    // float FinalScore = (ResourceScore * 1.0f) + (TradeScore * 1.0f) + (StrategicScore * 1.5f);
+    
+    // 2. PLACEMENT
+    // Pick highest scores.
+    // If (StrategicScore > HighThreshold) -> Specialization = Military; bIsFortified = true;
     
     // 3. NAME GENERATION
-    // If (Near River) -> Name = "River" + Suffix["bury", "ford"]
-    // If (Near Mountain) -> Name = "Iron" + Suffix["hold", "deep"]
+    // ...
 }
 ```
 
