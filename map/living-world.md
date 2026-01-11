@@ -120,6 +120,13 @@ public:
 *   **Purpose:** Holds the raw data of the generated world.
 *   **Architecture:** **Structure of Arrays (SoA)**. We do NOT use an array of `FCell` structs because we often process layers independently (e.g., eroding the `HeightMap` does not require reading the `CivilizationMap`).
 
+UENUM(BlueprintType)
+enum class EPlateType : uint8
+{
+    Oceanic,
+    Continental
+};
+
 ```cpp
 USTRUCT(BlueprintType)
 struct FWorldState
@@ -140,9 +147,9 @@ struct FWorldState
 
     UPROPERTY()
     TArray<float> MoistureMap;
-
+    
     UPROPERTY()
-    TArray<float> MoistureMap;
+    TArray<EPlateType> PlateTypes; // For tectonic visualization (Basalt vs Granite)
     
     // Derived Data (Cached for Civ logic)
     UPROPERTY()
@@ -342,8 +349,8 @@ void FCivilizationPass::CalculateStrategicValue(FWorldState& State, const FCivil
     ParallelFor(NumCells, [&](int32 i)
     {
         // Simple heuristic: Walkable if not too steep and not underwater
-        // (Slope calculation omitted for brevity)
-        bool bIsWater = State.MoistureMap[i] > DeepWaterThreshold && State.HeightMap[i] < 0.2f; 
+        // Use HeightMap for Ocean detection (Assuming < 0.2f is Sea Level)
+        bool bIsWater = State.HeightMap[i] < 0.2f; 
         bool bIsSteep = State.SlopeMap[i] > MaxWalkableSlope; 
         
         IsWalkable[i] = !bIsWater && !bIsSteep;
